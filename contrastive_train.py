@@ -28,13 +28,14 @@ import einops
 
 DATASET_GETTERS = {'ucf101': get_ucf101, 'ntuard': get_ntuard}
 
-
 def save_checkpoint(state, is_best, checkpoint):
     filename = f'checkpoint.pth.tar'
     filepath = os.path.join(checkpoint, filename)
     torch.save(state, filepath)
     if is_best:
         shutil.copyfile(filepath, os.path.join(checkpoint, f'model_best.pth.tar'))
+
+
 
 
 def set_seed(args):
@@ -94,6 +95,8 @@ def main_training_testing(EXP_NAME):
                         help='video frames path')
     parser.add_argument('--batch-size', default=64, type=int,
                         help='train batchsize')
+    parser.add_argument('--semi-supervised-batch-size', default=16, type=int,
+                        help='train semi-supervised batchsize')
     parser.add_argument('--no-clips', default=1, type=int,
                         help='number of clips')
     parser.add_argument('--no-views', default=2, type=int,
@@ -129,7 +132,7 @@ def main_training_testing(EXP_NAME):
                         help='Training and testing on cross subject split')
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank")
-    parser.add_argument('--num-class', default=101, type=int,
+    parser.add_argument('--num-class', default=60, type=int,
                         help='total classes')
     parser.add_argument('--exp-name', default='NTUARD_SUPERVISED_TRAINING', type=str,
                         help='Experiment name')
@@ -137,6 +140,11 @@ def main_training_testing(EXP_NAME):
                         help='Will train supervised and contrastive model simultaneously')
     parser.add_argument('--percentage', default=1.0, type=float,
                         help='in semi-supervised setting, what split do you want to use')
+    parser.add_argument('--joint-only-multiview-training', action='store_true', default=False,
+                        help='train using joint view data')
+    parser.add_argument('--combined-multiview-training', action='store_true', default=False,
+                        help='train using joint view and single view data')
+    parser.add_argument('--pretrained-path', default='', type=str, help='path to weights of contrastive pretrained model')
 
     args = parser.parse_args()
     if args.cross_subject and args.no_views < 3 and not args.hard_positive:
@@ -150,7 +158,7 @@ def main_training_testing(EXP_NAME):
     def create_model(args):
         if args.backbone == 'resnet3D18':
             import models.video_resnet as models
-            model = models.r3d_18(num_classes=args.num_class, pretrained=args.pretrained)
+            model = models.r3d_18(num_classes=args.num_class, pretrained=args.pretrained, positional_flag = 1)
         elif args.backbone == 'i3d':
             import models.i3d as models
             model = models.i3d(num_classes=args.num_class, use_gru=args.use_gru, pretrained=args.pretrained,
@@ -175,31 +183,51 @@ def main_training_testing(EXP_NAME):
 
     writer = SummaryWriter(out_dir)
 
-    train_datasets, test_dataset = DATASET_GETTERS[args.dataset]('Data', args.frames_path, contrastive=True, num_clips=args.no_clips, multiview=args.multiview, augment=args.augment, cross_subject=args.cross_subject, hard_positive=args.hard_positive, random_temporal=args.random_temporal)
+    train_datasets, test_dataset = DATASET_GETTERS[args.dataset]('Data', args.frames_path, contrastive=True, num_clips=args.no_clips, multiview=args.multiview, augment=args.augment, cross_subject=args.cross_subject, hard_positive=args.hard_positive, random_temporal=args.random_temporal, args=args)
 
     if args.semi_supervised_contrastive_joint_training:
-        with train_datasets[-1] as train_dataset:
-            train_datasets[-1] = random_split(train_dataset, (round(args.percentage * len(train_dataset)), round((1 - args.percentage) * len(train_dataset))))[0]
-        model = ContrastiveMultiTaskModel(_init_backbone, args.feature_size, args.num_classes)
+        train_dataset = train_datasets[-1]
+        train_datasets[-1] = random_split(train_dataset, (round(args.percentage * len(train_dataset)), round((1 - args.percentage) * len(train_dataset))))[0]
+        model = ContrastiveMultiTaskModel(_init_backbone, args.feature_size, args.num_class)
+        args.iteration = (len(train_datasets[0]) // args.batch_size // args.world_size) + (len(train_datasets[1]) // args.semi_supervised_batch_size // args.world_size)
+        test_loader = DataLoader(
+            test_dataset,
+            sampler=SequentialSampler(test_dataset),
+            batch_size=args.semi_supervised_batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True)
     else:
-        model = ContrastiveModel(_init_backbone, args.feature_size)
-    args.iteration = sum([len(dataset) for dataset in train_datasets]) // args.batch_size // args.world_size
+        _backbone_callback = _init_backbone
+        if args.pretrained_path != "":
+            args.pretrained_path += "/model_best.pth.tar"
+
+            def get_pretrained_model(num_classes):
+                assert os.path.isfile(args.pretrained_path), "Error: no checkpoint directory found!"
+                model = _init_backbone(num_classes=args.num_class)
+                state_dict = torch.load(args.pretrained_path)['state_dict']
+                model.load_state_dict(state_dict)
+
+                return model
+
+            _backbone_callback = get_pretrained_model
+
+
+
+        model = ContrastiveModel(_backbone_callback, args.feature_size)
+        args.iteration = len(train_datasets[0]) // args.batch_size // args.world_size
+
     model.to(args.device)
 
+    batch_sizes = [args.batch_size, args.semi_supervised_batch_size]
     train_loaders = [DataLoader(
         train_dataset,
         sampler=RandomSampler(train_dataset),
-        batch_size=args.batch_size,
+        batch_size=batch_sizes[i],
         num_workers=args.num_workers,
         drop_last=True,
-        pin_memory=True) for train_dataset in train_datasets]
+        pin_memory=True) for i, train_dataset in enumerate(train_datasets)]
 
-    test_loader = DataLoader(
-        test_dataset,
-        sampler=SequentialSampler(test_dataset),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=True)
+
 
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, nesterov=args.nesterov)
 
@@ -222,13 +250,15 @@ def main_training_testing(EXP_NAME):
         scheduler.load_state_dict(checkpoint['scheduler'])
         args.start_epoch = start_epoch
     model.zero_grad()
+    modes = ["contrastive", "semi_supervised"] if len(train_loaders) == 2 else ["contrastive"]
+
     try:
         for epoch in range(args.start_epoch, args.epochs):
-
             train_losses, train_accs = train(args, train_loaders, model, optimizer, scheduler, epoch)
-            for mode in ["contrastive", "semi_supervised"]:
+            for mode in modes:
                 writer.add_scalar(mode+'Loss/train', train_losses[mode], epoch)
                 writer.add_scalar(mode+'Accuracy/train', train_accs[mode], epoch)
+
             if args.semi_supervised_contrastive_joint_training:
                 test_loss, test_acc, _, _ = test(args, test_loader, model, epoch)
                 writer.add_scalar('Loss/test', test_loss, epoch)
@@ -268,17 +298,18 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
     top5 = AverageMeter()
     losses = {}
     end = time.time()
-    # TODO each mode should have seperate batch size
 
     if not args.no_progress:
         p_bar = tqdm(range(args.iteration))
 
     model.train()
     scaler = GradScaler() # rescale the loss to get gradients when using autocast
-    for mode, train_loader in zip(["contrastive", "semi_supervised"], train_loaders):
+    batch_idx = 0
+    modes = ["contrastive", "semi_supervised"] if len(train_loaders) == 2 else ["contrastive"]
+    for mode, train_loader in zip(modes, train_loaders):
         losses[mode] = AverageMeter()  # seperate loss for each mode
         top1[mode] = AverageMeter()  # seperate acc for each mode
-        for batch_idx, (inputs_x, labels) in enumerate(train_loader):
+        for inputs_x, labels in train_loader:
             data_time.update(time.time() - end)
 
             if mode == "contrastive":
@@ -289,14 +320,13 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
             labels = labels.to(args.device)
 
             with autocast():
-                logits_x = model(inputs, mode)
-                '''
-                try:
-                    logits, labels = info_nce_loss(logits_x, args.batch_size, args.no_views, supervised=args.hard_positive, labels=labels)
-                except Exception as e:
-                '''
+                if args.semi_supervised_contrastive_joint_training:
+                    logits = model(inputs, mode)
+                else:
+                    logits = model(inputs)
+
                 if mode == "contrastive":
-                    logits, labels = info_nce_loss(logits_x, args.batch_size, args.no_views)
+                    logits, labels = info_nce_loss(logits, args.batch_size, args.no_views)
             labels = labels.type(torch.LongTensor).to(args.device)
             loss = F.cross_entropy(logits, labels, reduction='mean')
             batch_top1, batch_top5 = accuracy(logits, labels, topk=(1, 5))
@@ -332,6 +362,7 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
                         acc=top1[mode].avg,
                         mode=mode))
                 p_bar.update()
+            batch_idx += 1
     if not args.no_progress:
         p_bar.close()
 
@@ -345,7 +376,7 @@ def test(args, test_loader, model, eval_mode=False):
     top5 = AverageMeter()
     end = time.time()
     if not args.no_progress:
-        test_loader = tqdm(test_loader)
+        p_bar = tqdm(range(len(test_loader)))
 
     results={i:[] for i in range(args.num_class)}
     model.eval()
@@ -376,17 +407,19 @@ def test(args, test_loader, model, eval_mode=False):
             batch_time.update(time.time() - end)
             end = time.time()
             if not args.no_progress:
-                test_loader.set_description(
-                    "Test Iter: {batch:4}/{iter:4}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Top 1 Acc: {acc:.3f}".format(
+                p_bar.set_description(
+                        "Test Iter: {batch:4}/{iter:4}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Top 1 Acc: {acc:.3f}".format(
                         batch=batch_idx + 1,
                         iter=len(test_loader),
                         data=data_time.avg,
                         bt=batch_time.avg,
                         loss=losses.avg,
-                        acc=top1.avg
+                        acc=top1.avg.item()
                     ))
+                p_bar.update()
+
         if not args.no_progress:
-            test_loader.close()
+            p_bar.close()
 
     return losses.avg, top1.avg, top5.avg, results
 

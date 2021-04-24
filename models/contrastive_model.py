@@ -1,9 +1,10 @@
 from torch import nn
+import torch
 class ContrastiveModel(nn.Module):
     def __init__(self, init_base_model, repr_size):
         super(ContrastiveModel, self).__init__()
         self.base_model = init_base_model(num_classes=repr_size)
-        self.base_model.fc = self.build_mlp(self.base_model.fc)
+        self.base_model.fc = self.build_mlp(self.base_model.fc, repr_size)
         self.eval_mode = False
 
     def get_layers(self, endpoint='C', num_classes=60):
@@ -37,10 +38,12 @@ class ContrastiveModel(nn.Module):
             param.requires_grad = True
         self.base_model.fc = None
 
-    def build_mlp(self, fc):
+    def build_mlp(self, fc, repr_size):
         in_features = fc.in_features
-        hidden = nn.Linear(in_features=in_features, out_features=in_features)
-        return nn.Sequential(hidden, nn.ReLU(), fc)
+        hidden = nn.Linear(in_features=in_features, out_features=repr_size)
+        output_layer = nn.Linear(in_features=repr_size, out_features=repr_size)
+
+        return nn.Sequential(hidden, nn.ReLU(), output_layer)
 
     def forward(self, x):
         x = self.base_model(x)
@@ -61,9 +64,10 @@ class ContrastiveMultiTaskModel(nn.Module):
         output_layer = nn.Linear(in_features=repr_size, out_features=repr_size)
         return nn.Sequential(hidden, nn.ReLU(), output_layer)
 
-    def forward(self, x, mode):
+    def forward(self, x, mode=None):
+        clips = x.shape[1]
         x = self.base_model(x)
-        #x = (torch.sum(x, dim=1) / clips) #TODO adapt for multiclip
+        x = (torch.sum(x, dim=1) / clips)
         if mode == "contrastive":
             x = self.contrastive_head(x)
         else:

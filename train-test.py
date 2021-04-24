@@ -131,7 +131,7 @@ def main_training_testing():
                         help='train using joint view and single view data')
     parser.add_argument('--curriculum-learning', action='store_true', default=False,
                         help='have a graduated learning scheme where initially single views are presented and then multiview joint data is presented after a number of epochs')
-    parser.add_argument('--pretrained_path', default='', type=str, help='path to weights of contrastive pretrained model')
+    parser.add_argument('--pretrained-path', default='', type=str, help='path to weights of contrastive pretrained model')
 
 
     args = parser.parse_args()

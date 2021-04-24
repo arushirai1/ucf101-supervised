@@ -88,11 +88,12 @@ def get_ntuard(root='Data', frames_path='/datasets/NTU-ARD/frames-240x135', num_
     elif args.combined_multiview_training:
         train_datasets.append(contrastive_dataset)
         train_datasets.append(train_dataset)
-    elif args.semi_supervised_contrastive_joint_training:
-        train_datasets.append(contrastive_dataset)
-        train_datasets.append(train_dataset)
     else:
         train_datasets.append(train_dataset)
+
+    if args.semi_supervised_contrastive_joint_training:
+        train_datasets.append(train_dataset)
+
     return train_datasets, test_dataset
 
 
