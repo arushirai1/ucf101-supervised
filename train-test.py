@@ -21,6 +21,7 @@ from tqdm import tqdm
 from Data.UCF101 import get_ucf101, get_ntuard
 from utils import AverageMeter, accuracy
 import einops
+from models.generator import get_decoder
 DATASET_GETTERS = {'ucf101': get_ucf101, 'ntuard': get_ntuard}
 
 
@@ -125,6 +126,8 @@ def main_training_testing():
                         help='Eval only mode')
     parser.add_argument('--pos', action='store_true', default=False,
                         help='add positional embedding for transformers')
+    parser.add_argument('--decoder', action='store_true', default=False,
+                        help='Will add the decoder') # TODO remove this option
     parser.add_argument('--joint-only-multiview-training', action='store_true', default=False,
                         help='train using joint view data')
     parser.add_argument('--combined-multiview-training', action='store_true', default=False,
@@ -269,6 +272,13 @@ def main_training_testing():
 
     test_accs = []
     model.zero_grad()
+    best_loss = math.inf
+
+    # TODO remove later
+    decoder=None
+    if args.decoder:
+        decoder = get_decoder().cuda(1)
+        model.fc = None
 
     if args.eval_only:
         test_loss, test_acc, _, results = test(args, test_loader, model, eval_mode=True)
@@ -279,8 +289,8 @@ def main_training_testing():
         print("Loss:", test_loss, "Acc:", test_acc)
     else:
         for epoch in range(args.start_epoch, args.epochs):
-            train_loss, train_acc = train(args, train_loaders, model, optimizer, scheduler, epoch)
-            test_loss, test_acc, _, _ = test(args, test_loader, model, epoch)
+            train_loss, train_acc = train(args, train_loaders, model, optimizer, scheduler, epoch, decoder=decoder)
+            test_loss, test_acc, _, _ = test(args, test_loader, model, epoch, decoder=decoder)
             '''
             if epoch > (args.epochs+1)/2 and epoch%30==0: 
                 test_loss, test_acc, test_acc_2 = test(args, test_loader, test_model, epoch)
@@ -293,14 +303,24 @@ def main_training_testing():
             writer.add_scalar('Accuracy/test', test_acc, epoch)
             writer.add_scalar('Loss/test', test_loss, epoch)
 
-            is_best = test_acc > best_acc
-            best_acc = max(test_acc, best_acc)
+            if decoder is None:
+                is_best = test_acc > best_acc
+                best_acc = max(test_acc, best_acc)
+            else:
+                is_best = test_loss < best_loss
+                best_loss = min(test_loss, best_loss)
 
             if args.local_rank == -1 or torch.distributed.get_rank() == 0:
+                # TODO remove decoder stuff
                 model_to_save = model.module if hasattr(model, "module") else model
+                state_dict_to_save = model_to_save.state_dict()
+                if decoder:
+                    decoder_to_save = decoder.module if hasattr(decoder, "module") else decoder
+                    state_dict_to_save = [model_to_save.state_dict(), decoder_to_save.state_dict()]
+
                 save_checkpoint({
                     'epoch': epoch + 1,
-                    'state_dict': model_to_save.state_dict(),
+                    'state_dict': state_dict_to_save,
                     'acc': test_acc,
                     'best_acc': best_acc,
                     'optimizer': optimizer.state_dict(),
@@ -333,7 +353,7 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 
-def train(args, train_loaders, model, optimizer, scheduler, epoch):
+def train(args, train_loaders, model, optimizer, scheduler, epoch, decoder=None):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     top1 = AverageMeter()
@@ -353,14 +373,18 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
             targets_x = targets_x.to(args.device)
 
             logits_x = model(inputs)
-            loss = F.cross_entropy(logits_x, targets_x, reduction='mean')
-            loss.backward()
+            generated_output = decoder(logits_x.cuda(1))
+            if decoder:
+                loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
+            else:
+                loss = F.cross_entropy(logits_x, targets_x, reduction='mean')
+                prec1, prec5 = accuracy(logits_x.data, targets_x, topk=(1, 5))
+                top1.update(prec1, inputs.size(0))
+                top5.update(prec5, inputs.size(0))
+
             losses.update(loss.item())
 
-            prec1, prec5 = accuracy(logits_x.data, targets_x, topk=(1, 5))
-            top1.update(prec1, inputs.size(0))
-            top5.update(prec5, inputs.size(0))
-
+            loss.backward()
             optimizer.step()
             scheduler.step()
             model.zero_grad()
@@ -386,7 +410,7 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
     return losses.avg, top1.avg
 
 
-def test(args, test_loader, model, eval_mode=False):
+def test(args, test_loader, model, eval_mode=False, decoder=None):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -409,17 +433,22 @@ def test(args, test_loader, model, eval_mode=False):
             targets = targets.to(args.device)
 
             outputs = model(inputs)
-            if eval_mode:
-                outputs=einops.reduce(outputs, '(b c) logits -> b logits', 'mean', c = args.no_clips) # TODO REDUCE BY AVG
 
-            loss = F.cross_entropy(outputs, targets, reduction='mean')
+            generated_output = decoder(outputs.cuda(1))
+            if decoder:
+                loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
+            else:
+                if eval_mode:
+                    outputs = einops.reduce(outputs, '(b c) logits -> b logits', 'mean',
+                                            c=args.no_clips)  # TODO REDUCE BY AVG
+                loss = F.cross_entropy(outputs, targets, reduction='mean')
 
-            for i, target in enumerate(targets):
-                results[target.item()].append(np.argmax(outputs.data[i].cpu().numpy()))
+                for i, target in enumerate(targets):
+                    results[target.item()].append(np.argmax(outputs.data[i].cpu().numpy()))
 
-            prec1, prec5 = accuracy(outputs.data, targets, topk=(1, 5))
-            top1.update(prec1, inputs.size(0))
-            top5.update(prec5, inputs.size(0))
+                prec1, prec5 = accuracy(outputs.data, targets, topk=(1, 5))
+                top1.update(prec1, inputs.size(0))
+                top5.update(prec5, inputs.size(0))
 
             losses.update(loss.item(), inputs.shape[0])
             batch_time.update(time.time() - end)

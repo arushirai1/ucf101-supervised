@@ -113,8 +113,8 @@ class BasicBlock(nn.Module):
     def forward(self, x):
         residual = x
 
-        out = self.conv1(x)
-        out = self.conv2(out)
+        out1 = self.conv1(x)
+        out = self.conv2(out1)
         if self.downsample is not None:
             residual = self.downsample(x)
 
@@ -164,6 +164,7 @@ class Bottleneck(nn.Module):
         out = self.conv3(out)
 
         if self.downsample is not None:
+            breakpoint()
             residual = self.downsample(x)
 
         out += residual
