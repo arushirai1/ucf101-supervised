@@ -128,6 +128,12 @@ def main_training_testing():
                         help='add positional embedding for transformers')
     parser.add_argument('--decoder', action='store_true', default=False,
                         help='Will add the decoder') # TODO remove this option
+    parser.add_argument('--simple', action='store_true', default=False,
+                        help='Will add just one block') # TODO remove this option
+    parser.add_argument('--sigmoid-loss', action='store_true', default=False,
+                        help='Use sigmoid loss for reconstruction instead of MSE ') # TODO remove this option
+    parser.add_argument('--sigmoid-activation', action='store_true', default=False,
+                        help='Use sigmoid activation for reconstruction ') # TODO remove this option
     parser.add_argument('--joint-only-multiview-training', action='store_true', default=False,
                         help='train using joint view data')
     parser.add_argument('--combined-multiview-training', action='store_true', default=False,
@@ -183,7 +189,7 @@ def main_training_testing():
         # only supporting resnet3d, TODO: Add support for i3d
         def _init_backbone(num_classes):
             from models import video_resnet
-            model = video_resnet.r3d_18(num_classes=num_classes, pretrained=args.pretrained, spatio_temporal = args.spatio_temporal)
+            model = video_resnet.r3d_18(num_classes=num_classes, pretrained=args.pretrained, spatio_temporal = args.spatio_temporal, positional_flag=1)
             return model
 
         if args.arch == 'contrastive':
@@ -223,6 +229,7 @@ def main_training_testing():
             model.eval_finetune(finetune=args.finetune, endpoint=args.endpoint, num_classes=args.num_class)
             model.load_state_dict(checkpoint['state_dict'])
         else:
+            args.pretrained_path = args.resume
             assert os.path.isfile(
                 args.pretrained_path), "Error: no checkpoint directory found!"
 
@@ -277,7 +284,7 @@ def main_training_testing():
     # TODO remove later
     decoder=None
     if args.decoder:
-        decoder = get_decoder().cuda(1)
+        decoder = get_decoder(simple=args.simple).cuda(1)
         model.fc = None
 
     if args.eval_only:
@@ -290,7 +297,8 @@ def main_training_testing():
     else:
         for epoch in range(args.start_epoch, args.epochs):
             train_loss, train_acc = train(args, train_loaders, model, optimizer, scheduler, epoch, decoder=decoder)
-            test_loss, test_acc, _, _ = test(args, test_loader, model, epoch, decoder=decoder)
+            test_loss, test_acc, _, _ = test(args, test_loader, model, eval_mode=False, decoder=decoder)
+
             '''
             if epoch > (args.epochs+1)/2 and epoch%30==0: 
                 test_loss, test_acc, test_acc_2 = test(args, test_loader, test_model, epoch)
@@ -352,6 +360,8 @@ def accuracy(output, target, topk=(1,)):
         res.append(count)
     return res
 
+def calculate_reconstruction_loss(y_hat, x):
+    return F.binary_cross_entropy(y_hat.view((y_hat.shape[0], -1)), x.view((x.shape[0], -1)), reduction='none').sum(dim=1).mean()
 
 def train(args, train_loaders, model, optimizer, scheduler, epoch, decoder=None):
     batch_time = AverageMeter()
@@ -373,10 +383,16 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch, decoder=None)
             targets_x = targets_x.to(args.device)
 
             logits_x = model(inputs)
-            generated_output = decoder(logits_x.cuda(1))
             if decoder:
-                loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
+                generated_output = decoder(logits_x.cuda(1))
+                if args.sigmoid_loss:
+                    loss = calculate_reconstruction_loss(generated_output, inputs.cuda(1))
+                else:
+                    inputs = inputs/255
+                    loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
             else:
+                logits_x = einops.reduce(logits_x, 'b c logits -> b logits', 'mean',
+                                        c=args.no_clips)
                 loss = F.cross_entropy(logits_x, targets_x, reduction='mean')
                 prec1, prec5 = accuracy(logits_x.data, targets_x, topk=(1, 5))
                 top1.update(prec1, inputs.size(0))
@@ -434,13 +450,21 @@ def test(args, test_loader, model, eval_mode=False, decoder=None):
 
             outputs = model(inputs)
 
-            generated_output = decoder(outputs.cuda(1))
             if decoder:
-                loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
+                generated_output = decoder(outputs.cuda(1))
+                if args.sigmoid_loss:
+                    loss = calculate_reconstruction_loss(generated_output, inputs.cuda(1))
+                else:
+                    inputs = inputs/255
+                    loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
             else:
+
                 if eval_mode:
                     outputs = einops.reduce(outputs, '(b c) logits -> b logits', 'mean',
-                                            c=args.no_clips)  # TODO REDUCE BY AVG
+                                            c=args.no_clips)
+                else:
+                    outputs = einops.reduce(outputs, 'b c logits -> b logits', 'mean',
+                                            c=args.no_clips)
                 loss = F.cross_entropy(outputs, targets, reduction='mean')
 
                 for i, target in enumerate(targets):

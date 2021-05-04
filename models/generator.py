@@ -25,12 +25,22 @@ class Block(nn.Module):
 '''
 
 class DecodeBlock(nn.Module):
-    def __init__(self, in_features, out_features, kernel_size, stride, dropout=0.3, padding=0, clips=1):
+    def __init__(self, in_features, out_features, kernel_size, stride, midplane=None, dropout=0.3, padding=0, clips=1, batch_norm=True):
         super(DecodeBlock, self).__init__()
-        self.block = nn.Sequential(nn.ConvTranspose3d(in_features, out_features, kernel_size, stride=stride, padding=padding),
-                                   nn.BatchNorm3d(out_features),
-                                   nn.ReLU(),
-                                   nn.Dropout(dropout))
+        if batch_norm:
+            self.block = nn.Sequential(nn.ConvTranspose3d(in_features, out_features, kernel_size, stride=stride, padding=padding),
+                                       nn.BatchNorm3d(out_features),
+                                       nn.ReLU(),
+                                       nn.Dropout(dropout))
+        else:
+            if midplane:
+                self.block = nn.Sequential(
+                    nn.ConvTranspose3d(in_features, midplane, kernel_size, stride=stride, padding=padding),
+                    nn.Conv3d(midplane, out_features, kernel_size=1, stride=1))
+            else:
+                self.block = nn.Sequential(
+                    nn.ConvTranspose3d(in_features, out_features, kernel_size, stride=stride, padding=padding))
+
         self.clips = clips
     def forward(self, x):
         if len(x.shape) == 3:
@@ -38,6 +48,7 @@ class DecodeBlock(nn.Module):
             x = self.block(x)
         elif len(x.shape) == 5:
             x = self.block(x)
+            x = x/255 # keep values between 0 and 1
             x = rearrange(x, 'b channels (clips no_frames) h w  -> b clips channels no_frames h w', clips = self.clips)
 
         return x
@@ -78,16 +89,52 @@ class ResidualBlock(nn.Module):
         out = self.dropout(out)
         return out
 
-def get_decoder(clips=1, crop_size=112):
+def get_decoder(clips=1, crop_size=112, simple=False, args=None):
     #perhaps we need to resize the input or we resize at the end it will be slower but... it seems like the only correct way to do it
     # how will upsampling work?? not sure... lets keep it limited to 1 clip... scale factor...
-    stem = DecodeBlock(64, 3, (3, 8, 8), stride=(1,2,2), padding=(1,3,3), clips=clips) # why did the kernel size need to increase
-    return nn.Sequential(nn.Linear(512,512),
-                         nn.ReLU(),
-                         nn.Dropout(0.3),
-                         DecodeBlock(512, 512, kernel_size=(1, 7, 7), stride=1), # undo effect of avg pool
-                         ResidualBlock(512, 256, up_sample_size=(2,14,14)),
-                         ResidualBlock(256, 128, up_sample_size=(4, 28, 28)),
-                         ResidualBlock(128, 64, up_sample_size=(8, 56, 56)),
-                         stem)
+    layers = []
+    if not simple:
+        #stem = DecodeBlock(64, 256*3, (3, 8, 8), midplane=64, stride=(1,2,2), padding=(1,3,3), clips=clips, batch_norm=False) # why did the kernel size need to increase
+        stem = DecodeBlock(64, 3, (3, 8, 8), stride=(1,2,2), padding=(1,3,3), clips=clips, batch_norm=False) # why did the kernel size need to increase
+        if args and args.sigmoid_activation:
+            layers = [nn.Linear(512,512),
+                             nn.ReLU(),
+                             nn.Dropout(0.3),
+                             DecodeBlock(512, 512, kernel_size=(1, 7, 7), stride=1), # undo effect of avg pool
+                             ResidualBlock(512, 256, up_sample_size=(2,14,14)),
+                             ResidualBlock(256, 128, up_sample_size=(4, 28, 28)),
+                             ResidualBlock(128, 64, up_sample_size=(8, 56, 56)),
+                             stem,
+                             nn.Sigmoid()]
+        else:
+            layers = [nn.Linear(512,512),
+                             nn.ReLU(),
+                             nn.Dropout(0.3),
+                             DecodeBlock(512, 512, kernel_size=(1, 7, 7), stride=1), # undo effect of avg pool
+                             ResidualBlock(512, 256, up_sample_size=(2,14,14)),
+                             ResidualBlock(256, 128, up_sample_size=(4, 28, 28)),
+                             ResidualBlock(128, 64, up_sample_size=(8, 56, 56)),
+                             stem]
+        return nn.Sequential(*layers)
+    else:
+        stem = DecodeBlock(512,3, kernel_size=(8,12,12), stride=17, padding=(0,1,1), clips=clips, batch_norm=False) # why did the kernel size need to increase
+        return nn.Sequential(nn.Linear(512,512),
+                             nn.ReLU(),
+                             nn.Dropout(0.3),
+                             DecodeBlock(512, 512, kernel_size=(1, 7, 7), stride=1),
+                             stem)
+'''
+x = torch.rand(5, 1, 512)
+decoder1 = get_decoder(simple=False)
+print("test")
+y_hat =decoder1(x)
+print(y_hat.shape)
+
+y = torch.rand(5, 3, 8, 112, 112)
+import torch.nn.functional as F
+
+y_hat = rearrange(y_hat, 'b clips (channels range) no_frames h w -> b  channels (clips no_frames) h w range', clips=1, channels=3)
+
+print(F.cross_entropy(y_hat, y))
+'''
 
