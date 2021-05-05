@@ -128,6 +128,10 @@ def main_training_testing():
                         help='add positional embedding for transformers')
     parser.add_argument('--decoder', action='store_true', default=False,
                         help='Will add the decoder') # TODO remove this option
+    parser.add_argument('--cnndecoder', action='store_true', default=False,
+                        help='Will add the cnndecoder') # TODO remove this option
+    parser.add_argument('--normalize-constant', default=1, type=int,
+                        help='Divide values by') # TODO remove this option
     parser.add_argument('--simple', action='store_true', default=False,
                         help='Will add just one block') # TODO remove this option
     parser.add_argument('--sigmoid-loss', action='store_true', default=False,
@@ -284,7 +288,7 @@ def main_training_testing():
     # TODO remove later
     decoder=None
     if args.decoder:
-        decoder = get_decoder(simple=args.simple).cuda(1)
+        decoder = get_decoder(simple=args.simple, args=args).cuda(1)
         model.fc = None
 
     if args.eval_only:
@@ -388,7 +392,7 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch, decoder=None)
                 if args.sigmoid_loss:
                     loss = calculate_reconstruction_loss(generated_output, inputs.cuda(1))
                 else:
-                    inputs = inputs/255
+                    inputs = inputs / args.normalize_constant
                     loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
             else:
                 logits_x = einops.reduce(logits_x, 'b c logits -> b logits', 'mean',
@@ -455,7 +459,7 @@ def test(args, test_loader, model, eval_mode=False, decoder=None):
                 if args.sigmoid_loss:
                     loss = calculate_reconstruction_loss(generated_output, inputs.cuda(1))
                 else:
-                    inputs = inputs/255
+                    inputs = inputs/ args.normalize_constant
                     loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
             else:
 

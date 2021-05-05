@@ -25,7 +25,7 @@ class Block(nn.Module):
 '''
 
 class DecodeBlock(nn.Module):
-    def __init__(self, in_features, out_features, kernel_size, stride, midplane=None, dropout=0.3, padding=0, clips=1, batch_norm=True):
+    def __init__(self, in_features, out_features, kernel_size, stride, midplane=None, dropout=0.3, padding=0, clips=1, batch_norm=True, norm_constant=None):
         super(DecodeBlock, self).__init__()
         if batch_norm:
             self.block = nn.Sequential(nn.ConvTranspose3d(in_features, out_features, kernel_size, stride=stride, padding=padding),
@@ -40,7 +40,7 @@ class DecodeBlock(nn.Module):
             else:
                 self.block = nn.Sequential(
                     nn.ConvTranspose3d(in_features, out_features, kernel_size, stride=stride, padding=padding))
-
+        self.norm_constant = norm_constant
         self.clips = clips
     def forward(self, x):
         if len(x.shape) == 3:
@@ -48,7 +48,7 @@ class DecodeBlock(nn.Module):
             x = self.block(x)
         elif len(x.shape) == 5:
             x = self.block(x)
-            x = x/255 # keep values between 0 and 1
+            x = x/self.norm_constant # keep values between 0 and 1
             x = rearrange(x, 'b channels (clips no_frames) h w  -> b clips channels no_frames h w', clips = self.clips)
 
         return x
@@ -89,13 +89,73 @@ class ResidualBlock(nn.Module):
         out = self.dropout(out)
         return out
 
+class MemEfficientConv3D(nn.Module):
+    def __init__(self, in_feature, out_feature, kernel_size, stride, padding):
+        super(MemEfficientConv3D, self).__init__()
+        layers = []
+        if out_feature < in_feature:
+            layers.append(nn.Conv3d(in_feature, out_feature, kernel_size=1)) # reduce number of feature maps first
+            in_feature = out_feature
+        layers.append(nn.Conv3d(in_feature, out_feature, kernel_size=kernel_size, stride=stride, padding=padding))
+
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
+
+class CNNDecoder(nn.Module):
+    def __init__(self, norm_constant):
+        super(CNNDecoder, self).__init__()
+        self.layers = self._build_layers()
+        self.norm_constant = norm_constant
+
+    def _build_block(self, in_feature, midplane, out_feature, kernel, stride, relu=True, momentum=0.9, padding=0):
+        if type(kernel) == list:
+            layers = [
+                MemEfficientConv3D(in_feature, midplane, kernel_size=kernel[0], stride=stride, padding=padding),
+                MemEfficientConv3D(midplane, out_feature, kernel_size=kernel[1], stride=stride, padding=padding)
+            ]
+        else:
+            layers = [
+                MemEfficientConv3D(in_feature, midplane, kernel_size=kernel, stride=stride, padding=padding),
+                MemEfficientConv3D(midplane, out_feature, kernel_size=kernel, stride=stride, padding=padding)
+            ]
+        if relu:
+            layers.insert(1, nn.ReLU())
+            layers.append(nn.ReLU())
+            layers.append(nn.BatchNorm3d(out_feature, momentum=momentum))
+
+        return nn.Sequential(*layers)
+
+    def _build_layers(self):
+        layers = []
+        layers.append(nn.Upsample((8, 28, 28)))
+        layers.append(self._build_block(in_feature=512, midplane=256, out_feature=256, kernel=(5,5,5), stride=(1,1,1), padding=(2,2,2)))
+        layers.append(nn.Upsample(scale_factor=(1,2,2)))
+        layers.append(self._build_block(in_feature=256, midplane=256, out_feature=128, kernel=(5,5,5), stride=(1,1,1), padding=(2,2,2)))
+        layers.append(nn.Upsample(scale_factor=(1,2,2)))
+        layers.append(self._build_block(in_feature=128, midplane=64, out_feature=64, kernel=[(5,5,5), (3,3,3)], stride=(1,1,1), padding=(1,1,1)))
+        layers.append(nn.Conv3d(64, 3, kernel_size=(1,1,1), stride=(1,1,1), padding=(1,1,1)))
+        layers.append(nn.Tanh())
+        return nn.Sequential(*layers)
+
+    def forward(self, x, num_frames=8):
+        x = torch.repeat_interleave(x, num_frames, dim=1)
+        x = rearrange(x, 'b num_frames features -> b features num_frames 1 1')
+        x = self.layers(x)
+        x = x / self.norm_constant
+        x = rearrange(x, 'b channels num_frames h w -> b 1 channels num_frames h w')
+        return x
+
 def get_decoder(clips=1, crop_size=112, simple=False, args=None):
     #perhaps we need to resize the input or we resize at the end it will be slower but... it seems like the only correct way to do it
     # how will upsampling work?? not sure... lets keep it limited to 1 clip... scale factor...
+    if args.cnndecoder:
+        return CNNDecoder(norm_constant=args.normalize_constant)
     layers = []
     if not simple:
         #stem = DecodeBlock(64, 256*3, (3, 8, 8), midplane=64, stride=(1,2,2), padding=(1,3,3), clips=clips, batch_norm=False) # why did the kernel size need to increase
-        stem = DecodeBlock(64, 3, (3, 8, 8), stride=(1,2,2), padding=(1,3,3), clips=clips, batch_norm=False) # why did the kernel size need to increase
+        stem = DecodeBlock(64, 3, (3, 8, 8), stride=(1,2,2), padding=(1,3,3), clips=clips, batch_norm=False, norm_constant=args.normalize_constant) # why did the kernel size need to increase
         if args and args.sigmoid_activation:
             layers = [nn.Linear(512,512),
                              nn.ReLU(),
@@ -123,10 +183,8 @@ def get_decoder(clips=1, crop_size=112, simple=False, args=None):
                              nn.Dropout(0.3),
                              DecodeBlock(512, 512, kernel_size=(1, 7, 7), stride=1),
                              stem)
-'''
-x = torch.rand(5, 1, 512)
-decoder1 = get_decoder(simple=False)
-print("test")
+
+'''print("test")
 y_hat =decoder1(x)
 print(y_hat.shape)
 
@@ -137,4 +195,3 @@ y_hat = rearrange(y_hat, 'b clips (channels range) no_frames h w -> b  channels 
 
 print(F.cross_entropy(y_hat, y))
 '''
-
