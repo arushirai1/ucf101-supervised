@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch
 from einops import repeat, rearrange
-
+from torch.nn.init import xavier_normal_
 '''
 class Block(nn.Module):
     def __init__(self, in_features, out_features, kernel_sizes, strides, paddings=[0], activation_functions=[], batch_norm_flag=True):
@@ -40,8 +40,15 @@ class DecodeBlock(nn.Module):
             else:
                 self.block = nn.Sequential(
                     nn.ConvTranspose3d(in_features, out_features, kernel_size, stride=stride, padding=padding))
-        self.norm_constant = norm_constant
+        self.norm_constant = 1
         self.clips = clips
+        self._initialize_params()
+
+    def _initialize_params(self):
+        for layer in self.block:
+            if type(layer) in [nn.ConvTranspose3d, nn.Conv3d]:
+                xavier_normal_(layer.weight)
+
     def forward(self, x):
         if len(x.shape) == 3:
             x = rearrange(x, 'b clips f -> b f (clips 1) 1 1')
@@ -74,6 +81,13 @@ class ResidualBlock(nn.Module):
         self.convB = self._get_conv(out_features, out_features,kernel_size, stride)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
+        self._initialize_params()
+
+    def _initialize_params(self):
+        xavier_normal_(self.upsample_conv[0].weight)
+        xavier_normal_(self.convA[0].weight)
+        xavier_normal_(self.convB[0].weight)
+
     def _get_conv(self, in_features, out_features, kernel_size=(3,3,3), stride=1, padding=1):
         return nn.Sequential(nn.Conv3d(in_features, out_features, kernel_size, stride=stride, padding=padding),
                              nn.BatchNorm3d(out_features))
@@ -102,12 +116,26 @@ class MemEfficientConv3D(nn.Module):
 
     def forward(self, x):
         return self.layers(x)
+def initialize_params(layer):
+    if type(layer) == nn.ReLU or type(layer) == nn.Sigmoid or type(layer) == nn.Tanh:
+        return
+    if type(layer) == nn.Sequential or type(layer) == MemEfficientConv3D:
+        if type(layer) == MemEfficientConv3D:
+            layer = layer.layers
+        for sublayer in layer:
+            if type(sublayer) != nn.BatchNorm3d:
+                initialize_params(sublayer)
+    else:
+        xavier_normal_(layer.weight)
 
 class CNNDecoder(nn.Module):
     def __init__(self, norm_constant):
         super(CNNDecoder, self).__init__()
         self.layers = self._build_layers()
-        self.norm_constant = norm_constant
+        self.norm_constant = 1
+        for layer in self.layers:
+            if type(layer) != nn.Upsample:
+                initialize_params(layer)
 
     def _build_block(self, in_feature, midplane, out_feature, kernel, stride, relu=True, momentum=0.9, padding=0):
         if type(kernel) == list:
@@ -147,16 +175,40 @@ class CNNDecoder(nn.Module):
         x = rearrange(x, 'b channels num_frames h w -> b 1 channels num_frames h w')
         return x
 
+class ResNetDecoder(nn.Module):
+    def __init__(self, stem, repr_size=128):
+        super(ResNetDecoder, self).__init__()
+        self.transformation_block = self._get_transformation_block(repr_size)
+        self.layers = nn.Sequential(nn.Linear(repr_size, 512),
+                  nn.ReLU(),
+                  nn.Dropout(0.3),
+                  DecodeBlock(512, 512, kernel_size=(1, 7, 7), stride=1),  # undo effect of avg pool
+                  ResidualBlock(512, 256, up_sample_size=(2, 14, 14)),
+                  ResidualBlock(256, 128, up_sample_size=(4, 28, 28)),
+                  ResidualBlock(128, 64, up_sample_size=(8, 56, 56)),
+                  stem,
+                  nn.Tanh())
+
+    def _get_transformation_block(self, repr_size):
+        # returns a transformed output to compare against other representations
+        return nn.Sequential(nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.3), nn.Linear(256, repr_size))
+
+    def forward(self, x):
+        repr = self.transformation_block(x)
+        x = self.layers(repr)
+        return repr, x
+
 def get_decoder(clips=1, crop_size=112, simple=False, args=None):
-    #perhaps we need to resize the input or we resize at the end it will be slower but... it seems like the only correct way to do it
     # how will upsampling work?? not sure... lets keep it limited to 1 clip... scale factor...
-    if args.cnndecoder:
+    '''
+    if 'cnndecoder' in args.keys() and args.cnndecoder:
         return CNNDecoder(norm_constant=args.normalize_constant)
+    '''
     layers = []
     if not simple:
         #stem = DecodeBlock(64, 256*3, (3, 8, 8), midplane=64, stride=(1,2,2), padding=(1,3,3), clips=clips, batch_norm=False) # why did the kernel size need to increase
-        stem = DecodeBlock(64, 3, (3, 8, 8), stride=(1,2,2), padding=(1,3,3), clips=clips, batch_norm=False, norm_constant=args.normalize_constant) # why did the kernel size need to increase
-        if args and args.sigmoid_activation:
+        stem = DecodeBlock(64, 3, (3, 8, 8), stride=(1,2,2), padding=(1,3,3), clips=clips, batch_norm=False) # why did the kernel size need to increase
+        if type(args) == dict and 'sigmoid_activation' in args.keys() and args.sigmoid_activation:
             layers = [nn.Linear(512,512),
                              nn.ReLU(),
                              nn.Dropout(0.3),
@@ -167,14 +219,10 @@ def get_decoder(clips=1, crop_size=112, simple=False, args=None):
                              stem,
                              nn.Sigmoid()]
         else:
-            layers = [nn.Linear(512,512),
-                             nn.ReLU(),
-                             nn.Dropout(0.3),
-                             DecodeBlock(512, 512, kernel_size=(1, 7, 7), stride=1), # undo effect of avg pool
-                             ResidualBlock(512, 256, up_sample_size=(2,14,14)),
-                             ResidualBlock(256, 128, up_sample_size=(4, 28, 28)),
-                             ResidualBlock(128, 64, up_sample_size=(8, 56, 56)),
-                             stem]
+            if type(args) == dict:
+                return ResNetDecoder(stem, args['feature_size'])
+            else:
+                return ResNetDecoder(stem, args.feature_size)
         return nn.Sequential(*layers)
     else:
         stem = DecodeBlock(512,3, kernel_size=(8,12,12), stride=17, padding=(0,1,1), clips=clips, batch_norm=False) # why did the kernel size need to increase

@@ -49,14 +49,18 @@ class ContrastiveDataset(Dataset):
         video_paths, video_label = self.video_paths[idx], self.targets[idx]
         positives = []
         ids = []
+
         for view_dict in video_paths:
-                video, ids_tmp = self.get_video(view_dict, ids)
-                if not self.random_temporal:
-                    ids = ids_tmp
-                positives.append(video)
+            video, ids_tmp = self.get_video(view_dict, ids)
+            if not self.random_temporal:
+                ids = ids_tmp
+            positives.append(video)
         if self.args.combined_multiview_training or self.args.joint_only_multiview_training:
             positives = torch.cat(positives, dim=0)
+        if self.args.classify_view:
+            return positives, video_label-1, [int(video_path[-1])-1 for video_path in video_paths]
         return positives, video_label-1
+
     def _get_ids(self, no_frames, total_frames, skip_rate, ids):
         def handle_edge_case(ratio):
             potential = abs(int(ratio*no_frames))
@@ -153,7 +157,6 @@ class ContrastiveDataset(Dataset):
         data_paths = []
         targets = []
         annotation_path = self.get_annotation_path()
-
         with open(annotation_path, "r") as fid:
             dataList = fid.readlines()
             for x in dataList:

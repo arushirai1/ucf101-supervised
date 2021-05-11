@@ -130,6 +130,8 @@ def main_training_testing():
                         help='Will add the decoder') # TODO remove this option
     parser.add_argument('--cnndecoder', action='store_true', default=False,
                         help='Will add the cnndecoder') # TODO remove this option
+    parser.add_argument('--local-contrastive-loss', action='store_true', default=False,
+                        help='Will add the local contrastive loss') # TODO remove this option
     parser.add_argument('--normalize-constant', default=1, type=int,
                         help='Divide values by') # TODO remove this option
     parser.add_argument('--simple', action='store_true', default=False,
@@ -382,18 +384,26 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch, decoder=None)
 
     for train_loader in train_loaders:
         for batch_idx, (inputs_x, targets_x) in enumerate(train_loader):
+
             data_time.update(time.time() - end)
             inputs = inputs_x.to(args.device)
             targets_x = targets_x.to(args.device)
 
             logits_x = model(inputs)
             if decoder:
-                generated_output = decoder(logits_x.cuda(1))
+                repr, generated_output = decoder(logits_x.cuda(1))
                 if args.sigmoid_loss:
                     loss = calculate_reconstruction_loss(generated_output, inputs.cuda(1))
                 else:
-                    inputs = inputs / args.normalize_constant
                     loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
+                if args.local_contrastive_loss:
+                    logits_x_2 = torch.split(logits_x, logits_x.shape[0]/2)
+                    logits_x_2=torch.stack(logits_x_2[1], logits_x_2[0])
+
+                    logits_x = einops.reduce(logits_x, 'b c logits -> b logits', 'mean',
+                                             c=args.no_clips)
+                    # TODO continue fwd pass
+                    loss += 0.3*F.triplet_margin_loss(logits_x, logits_x_2, repr)+0.7*F.cross_entropy(logits_x, targets_x, reduction='mean')
             else:
                 logits_x = einops.reduce(logits_x, 'b c logits -> b logits', 'mean',
                                         c=args.no_clips)
@@ -459,7 +469,6 @@ def test(args, test_loader, model, eval_mode=False, decoder=None):
                 if args.sigmoid_loss:
                     loss = calculate_reconstruction_loss(generated_output, inputs.cuda(1))
                 else:
-                    inputs = inputs/ args.normalize_constant
                     loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
             else:
 

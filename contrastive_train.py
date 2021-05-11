@@ -8,7 +8,6 @@ import time
 from copy import deepcopy
 from collections import OrderedDict
 import pickle
-import scipy
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -20,7 +19,7 @@ from tensorboardX import SummaryWriter
 from tqdm import tqdm
 from Data.UCF101 import get_ucf101, get_ntuard
 from utils import AverageMeter, accuracy
-from models.contrastive_model import ContrastiveModel, ContrastiveMultiTaskModel
+from models.contrastive_model import ContrastiveModel, ContrastiveMultiTaskModel, ContrastiveDecoderModel
 import math
 from loss import info_nce_loss
 from torch.cuda.amp import autocast, GradScaler
@@ -34,9 +33,6 @@ def save_checkpoint(state, is_best, checkpoint):
     torch.save(state, filepath)
     if is_best:
         shutil.copyfile(filepath, os.path.join(checkpoint, f'model_best.pth.tar'))
-
-
-
 
 def set_seed(args):
     random.seed(args.seed)
@@ -145,8 +141,21 @@ def main_training_testing(EXP_NAME):
     parser.add_argument('--combined-multiview-training', action='store_true', default=False,
                         help='train using joint view and single view data')
     parser.add_argument('--pretrained-path', default='', type=str, help='path to weights of contrastive pretrained model')
+    parser.add_argument('--decoder', action='store_true', default=False,
+                        help='Will add the decoder') # TODO remove this option
+    parser.add_argument('--alpha', default=0.4, type=float,
+                        help='The weight of local contrastive loss')
+    parser.add_argument('--beta', default=0.6, type=float,
+                        help='The weight of global contrastive loss')
+    parser.add_argument('--margin', default=0, type=float,
+                        help='The margin for the triplet loss used for the local contrastive loss')
+    parser.add_argument('--freeze-mse-grad', action='store_true', default=False,
+                        help='Freeze the mse grad')
+    parser.add_argument('--classify-view', action='store_true', default=False,
+                        help='Classify the view')
 
     args = parser.parse_args()
+
     if args.cross_subject and args.no_views < 3 and not args.hard_positive:
         args.no_views = 3
     print(args)
@@ -213,11 +222,10 @@ def main_training_testing(EXP_NAME):
 
 
 
-        model = ContrastiveModel(_backbone_callback, args.feature_size)
+        model = ContrastiveModel(_backbone_callback, args.feature_size) if not args.decoder else ContrastiveDecoderModel(_backbone_callback, args.feature_size)
         args.iteration = len(train_datasets[0]) // args.batch_size // args.world_size
 
-    model.to(args.device)
-
+    model.to(args.device) if not args.decoder else model.distribute_gpus([0])
     batch_sizes = [args.batch_size, args.semi_supervised_batch_size]
     train_loaders = [DataLoader(
         train_dataset,
@@ -255,9 +263,10 @@ def main_training_testing(EXP_NAME):
     try:
         for epoch in range(args.start_epoch, args.epochs):
             train_losses, train_accs = train(args, train_loaders, model, optimizer, scheduler, epoch)
-            for mode in modes:
+            for mode in train_losses.keys():
                 writer.add_scalar(mode+'Loss/train', train_losses[mode], epoch)
-                writer.add_scalar(mode+'Accuracy/train', train_accs[mode], epoch)
+                if mode in modes:
+                    writer.add_scalar(mode+'Accuracy/train', train_accs[mode], epoch)
 
             if args.semi_supervised_contrastive_joint_training:
                 test_loss, test_acc, _, _ = test(args, test_loader, model, epoch)
@@ -307,11 +316,14 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
     batch_idx = 0
     modes = ["contrastive", "semi_supervised"] if len(train_loaders) == 2 else ["contrastive"]
     for mode, train_loader in zip(modes, train_loaders):
+
         losses[mode] = AverageMeter()  # seperate loss for each mode
+        if args.decoder:
+            for loss_type in ["global_contrastive_loss", "local_contrastive_loss", "mse_loss"]:
+                losses[loss_type] = AverageMeter()
         top1[mode] = AverageMeter()  # seperate acc for each mode
         for inputs_x, labels in train_loader:
             data_time.update(time.time() - end)
-
             if mode == "contrastive":
                 inputs_x = torch.cat(inputs_x, dim=0)
                 labels = torch.cat([labels for i in range(args.no_views)])
@@ -323,18 +335,40 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
                 if args.semi_supervised_contrastive_joint_training:
                     logits = model(inputs, mode)
                 else:
-                    logits = model(inputs)
+                    if args.decoder:
+                        compressed_repr, generated_output, contrastive_repr = model(inputs, detach=args.freeze_mse_grad)
+                        logits = contrastive_repr = einops.reduce(contrastive_repr, 'b c logits -> b logits', 'mean', c=args.no_clips)
+                        compressed_repr = einops.reduce(compressed_repr, 'b c logits -> b logits', 'mean', c=args.no_clips)
+                        reconstruction_loss = torch.nn.MSELoss()(generated_output, inputs)
+                    else:
+                        logits = model(inputs)
 
                 if mode == "contrastive":
                     logits, labels = info_nce_loss(logits, args.batch_size, args.no_views)
+
             labels = labels.type(torch.LongTensor).to(args.device)
             loss = F.cross_entropy(logits, labels, reduction='mean')
+            if args.decoder:
+
+                logits_x_2 = torch.split(contrastive_repr, contrastive_repr.shape[0] // 2)
+                logits_x_2 = torch.stack([logits_x_2[1], logits_x_2[0]]).view(-1,args.feature_size)
+                local_contrastive_loss = F.triplet_margin_loss(contrastive_repr, logits_x_2, compressed_repr, margin=args.margin)
+                global_contrastive_loss = loss
+
+                loss = reconstruction_loss + args.alpha*local_contrastive_loss + args.beta*global_contrastive_loss
+                #loss = args.alpha*local_contrastive_loss + args.beta*global_contrastive_loss
+
             batch_top1, batch_top5 = accuracy(logits, labels, topk=(1, 5))
 
             # Scales the loss, and calls backward()
             # to create scaled gradients
             scaler.scale(loss).backward()
             losses[mode].update(loss.item())
+            if args.decoder:
+                losses["global_contrastive_loss"].update(global_contrastive_loss.item())
+                losses["local_contrastive_loss"].update(local_contrastive_loss.item())
+                losses["mse_loss"].update(reconstruction_loss.item())
+
             top1[mode].update(batch_top1[0])
             top5.update(batch_top5[0])
             # Unscales gradients and calls
@@ -349,18 +383,35 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
             end = time.time()
 
             if not args.no_progress:
-                p_bar.set_description(
-                    "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.6f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Top 1 Acc: {acc:.3f} Mode: {mode}".format(
-                        epoch=epoch + 1,
-                        epochs=args.epochs,
-                        batch=batch_idx + 1,
-                        iter=args.iteration,
-                        lr=scheduler.get_lr()[0],
-                        data=data_time.avg,
-                        bt=batch_time.avg,
-                        loss=losses[mode].avg,
-                        acc=top1[mode].avg,
-                        mode=mode))
+                if not args.decoder:
+                    p_bar.set_description(
+                        "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.6f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Top 1 Acc: {acc:.3f} Mode: {mode}".format(
+                            epoch=epoch + 1,
+                            epochs=args.epochs,
+                            batch=batch_idx + 1,
+                            iter=args.iteration,
+                            lr=scheduler.get_lr()[0],
+                            data=data_time.avg,
+                            bt=batch_time.avg,
+                            loss=losses[mode].avg,
+                            acc=top1[mode].avg,
+                            mode=mode))
+                else:
+                    p_bar.set_description(
+                        "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. Total Loss: {total_loss:.4f}. MSE Loss: {mse_loss:.4f}. Local Contrastive Loss: {local_contrastive_loss:.4f}. Global Contrastive Loss: {global_contrastive_loss:.4f}. LR: {lr:.6f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Top 1 Acc: {acc:.3f} Mode: {mode}".format(
+                            epoch=epoch + 1,
+                            epochs=args.epochs,
+                            batch=batch_idx + 1,
+                            iter=args.iteration,
+                            lr=scheduler.get_lr()[0],
+                            data=data_time.avg,
+                            bt=batch_time.avg,
+                            total_loss=losses[mode].avg,
+                            mse_loss=losses["mse_loss"].avg,
+                            local_contrastive_loss=losses["local_contrastive_loss"].avg,
+                            global_contrastive_loss=losses["global_contrastive_loss"].avg,
+                            acc=top1[mode].avg,
+                            mode=mode))
                 p_bar.update()
             batch_idx += 1
     if not args.no_progress:
@@ -391,6 +442,7 @@ def test(args, test_loader, model, eval_mode=False):
             targets = targets.to(args.device)
 
             outputs = model(inputs)
+            # TODO: change loss calculation for each output type
             if eval_mode:
                 outputs=einops.reduce(outputs, '(b c) logits -> b logits', 'mean', c = args.no_clips)
 
@@ -408,7 +460,7 @@ def test(args, test_loader, model, eval_mode=False):
             end = time.time()
             if not args.no_progress:
                 p_bar.set_description(
-                        "Test Iter: {batch:4}/{iter:4}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Top 1 Acc: {acc:.3f}".format(
+                    "Test Iter: {batch:4}/{iter:4}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Top 1 Acc: {acc:.3f}".format(
                         batch=batch_idx + 1,
                         iter=len(test_loader),
                         data=data_time.avg,

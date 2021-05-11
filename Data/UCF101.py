@@ -46,7 +46,8 @@ def get_ucf101(root='Data', frames_path=''):
 
 
 def get_ntuard(root='Data', frames_path='/datasets/NTU-ARD/frames-240x135', num_clips=1, cross_subject=False, contrastive=False, augment=True, hard_positive=False, random_temporal=True, multiview=False, args=None):
-
+    normal_mean=128.
+    normal_std = 128
     ## augmentations
     crop_scales = [1.0]
     for _ in range(1, 5):
@@ -56,13 +57,17 @@ def get_ntuard(root='Data', frames_path='/datasets/NTU-ARD/frames-240x135', num_
         Scale(136),
         CenterCrop(112),
         ToTensor(1),
+        transforms.Normalize(mean=normal_mean, std=normal_std)
     ])
 
     transform_val = Compose([
         Scale(136),
         CenterCrop(112),
         ToTensor(1),
+        transforms.Normalize(mean=normal_mean, std=normal_std)
+
     ])
+    '''
     transform_contrastive = Compose([
         Scale(136),
         CenterCrop(112),
@@ -72,9 +77,10 @@ def get_ntuard(root='Data', frames_path='/datasets/NTU-ARD/frames-240x135', num_
         transforms.GaussianBlur(112 // 10),
         ToTensor(1),
     ])
+    '''
+
     train_datasets = []
-    if not augment:
-        transform_contrastive = transform_train
+    transform_contrastive = transform_train
     contrastive_dataset = ContrastiveDataset(root=root, fold=1, transform=transform_contrastive, num_clips=num_clips,
                                              frames_path=frames_path, cross_subject=cross_subject,
                                              hard_positive=hard_positive, random_temporal=random_temporal,
@@ -83,7 +89,7 @@ def get_ntuard(root='Data', frames_path='/datasets/NTU-ARD/frames-240x135', num_
                                  num_clips=num_clips, frames_path=frames_path)
     test_dataset = NTUARD_TRAIN(root=root, train=False, fold=1, cross_subject=cross_subject, transform=transform_val, num_clips=num_clips, frames_path=frames_path)
     keys = dir(args)
-    if 'contrastive' in keys and contrastive:
+    if contrastive:
         train_datasets.append(contrastive_dataset)
     elif 'combined_multiview_training' in keys and args.combined_multiview_training:
         train_datasets.append(contrastive_dataset)
