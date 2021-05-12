@@ -117,3 +117,51 @@ class ContrastiveDecoderModel(nn.Module):
 
 
         return compressed_repr, generated_output, contrastive_repr
+
+class ContrastiveDecoderModelWithViewClassification(nn.Module):
+    def __init__(self, init_base_model, repr_size, action_classes_size=60):
+        super(ContrastiveDecoderModelWithViewClassification, self).__init__()
+        self.encoder = init_base_model(num_classes=action_classes_size)
+        self.contrastive_head = self._build_mlp(self.encoder.fc.in_features, repr_size)
+        self.view_classifier = nn.Sequential(nn.Linear(repr_size, 1))
+        self.decoder = decoder(args={'feature_size': repr_size})
+        self.encoder.fc=None
+        self.devices=[0]
+
+    def _build_mlp(self, encoder_feature_size, repr_size):
+        hidden = nn.Linear(in_features=encoder_feature_size, out_features=repr_size)
+        output_layer = nn.Linear(in_features=repr_size, out_features=repr_size)
+        return nn.Sequential(hidden, nn.ReLU(), output_layer)
+
+    def distribute_gpus(self, devices):
+        if len(devices) > 1:
+            self.encoder.cuda(devices[0])
+            self.contrastive_head.cuda(devices[0])
+            self.decoder.cuda(devices[1])
+            self.view_classifier.cuda(devices[1])
+
+        else:
+            self.cuda(devices[0])
+
+        self.devices=devices
+
+    def forward(self, x, eval_mode=False, detach=False):
+        x = self.encoder(x)
+        contrastive_repr = self.contrastive_head(x)
+        if len(self.devices) == 1:
+            if detach:
+                compressed_repr, generated_output = self.decoder(x.detach())
+            else:
+                compressed_repr, generated_output = self.decoder(x)
+                view_classification = self.view_classifier(contrastive_repr - compressed_repr)
+        else:
+            compressed_repr, generated_output = self.decoder(x.cuda(self.devices[1]))
+            view_classification = self.view_classifier(compressed_repr)
+
+            # switch back to main gpu device
+            compressed_repr = compressed_repr.cuda(self.devices[0])
+            generated_output = generated_output.cuda(self.devices[0])
+            view_classification = view_classification.cuda(self.devices[0])
+
+
+        return compressed_repr, generated_output, contrastive_repr, view_classification

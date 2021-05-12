@@ -19,7 +19,7 @@ from tensorboardX import SummaryWriter
 from tqdm import tqdm
 from Data.UCF101 import get_ucf101, get_ntuard
 from utils import AverageMeter, accuracy
-from models.contrastive_model import ContrastiveModel, ContrastiveMultiTaskModel, ContrastiveDecoderModel
+from models.contrastive_model import ContrastiveModel, ContrastiveMultiTaskModel, ContrastiveDecoderModel, ContrastiveDecoderModelWithViewClassification
 import math
 from loss import info_nce_loss
 from torch.cuda.amp import autocast, GradScaler
@@ -223,6 +223,8 @@ def main_training_testing(EXP_NAME):
 
 
         model = ContrastiveModel(_backbone_callback, args.feature_size) if not args.decoder else ContrastiveDecoderModel(_backbone_callback, args.feature_size)
+        model = ContrastiveDecoderModelWithViewClassification(_backbone_callback, args.feature_size) if args.classify_view else model
+
         args.iteration = len(train_datasets[0]) // args.batch_size // args.world_size
 
     model.to(args.device) if not args.decoder else model.distribute_gpus([0])
@@ -319,11 +321,15 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
 
         losses[mode] = AverageMeter()  # seperate loss for each mode
         if args.decoder:
-            for loss_type in ["global_contrastive_loss", "local_contrastive_loss", "mse_loss"]:
+            for loss_type in ["global_contrastive_loss", "local_contrastive_loss", "mse_loss", "sigmoid_loss"]:
                 losses[loss_type] = AverageMeter()
         top1[mode] = AverageMeter()  # seperate acc for each mode
         for inputs_x, labels in train_loader:
             data_time.update(time.time() - end)
+
+            if args.classify_view:
+                view_label = torch.cat(labels[1], dim=0).to(args.device)
+                labels = labels[0]
             if mode == "contrastive":
                 inputs_x = torch.cat(inputs_x, dim=0)
                 labels = torch.cat([labels for i in range(args.no_views)])
@@ -336,7 +342,11 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
                     logits = model(inputs, mode)
                 else:
                     if args.decoder:
-                        compressed_repr, generated_output, contrastive_repr = model(inputs, detach=args.freeze_mse_grad)
+                        if args.classify_view:
+                            compressed_repr, generated_output, contrastive_repr, view_classification = model(inputs, detach=args.freeze_mse_grad)
+                            view_classification = view_classification.squeeze()
+                        else:
+                            compressed_repr, generated_output, contrastive_repr = model(inputs, detach=args.freeze_mse_grad)
                         logits = contrastive_repr = einops.reduce(contrastive_repr, 'b c logits -> b logits', 'mean', c=args.no_clips)
                         compressed_repr = einops.reduce(compressed_repr, 'b c logits -> b logits', 'mean', c=args.no_clips)
                         reconstruction_loss = torch.nn.MSELoss()(generated_output, inputs)
@@ -352,10 +362,13 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
 
                 logits_x_2 = torch.split(contrastive_repr, contrastive_repr.shape[0] // 2)
                 logits_x_2 = torch.stack([logits_x_2[1], logits_x_2[0]]).view(-1,args.feature_size)
-                local_contrastive_loss = F.triplet_margin_loss(contrastive_repr, logits_x_2, compressed_repr, margin=args.margin)
                 global_contrastive_loss = loss
-
-                loss = reconstruction_loss + args.alpha*local_contrastive_loss + args.beta*global_contrastive_loss
+                if args.classify_view:
+                    sigmoid_loss = torch.nn.BCEWithLogitsLoss()(view_classification, view_label.type(torch.FloatTensor).to(args.device))
+                    loss = reconstruction_loss + sigmoid_loss + global_contrastive_loss
+                else:
+                    local_contrastive_loss = F.triplet_margin_loss(contrastive_repr, logits_x_2, compressed_repr, margin=args.margin)
+                    loss = reconstruction_loss + args.alpha*local_contrastive_loss + args.beta*global_contrastive_loss
                 #loss = args.alpha*local_contrastive_loss + args.beta*global_contrastive_loss
 
             batch_top1, batch_top5 = accuracy(logits, labels, topk=(1, 5))
@@ -366,8 +379,12 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
             losses[mode].update(loss.item())
             if args.decoder:
                 losses["global_contrastive_loss"].update(global_contrastive_loss.item())
-                losses["local_contrastive_loss"].update(local_contrastive_loss.item())
                 losses["mse_loss"].update(reconstruction_loss.item())
+                if args.classify_view:
+                    losses["sigmoid_loss"].update(sigmoid_loss.item())
+                else:
+                    losses["local_contrastive_loss"].update(local_contrastive_loss.item())
+
 
             top1[mode].update(batch_top1[0])
             top5.update(batch_top5[0])
@@ -398,7 +415,7 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
                             mode=mode))
                 else:
                     p_bar.set_description(
-                        "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. Total Loss: {total_loss:.4f}. MSE Loss: {mse_loss:.4f}. Local Contrastive Loss: {local_contrastive_loss:.4f}. Global Contrastive Loss: {global_contrastive_loss:.4f}. LR: {lr:.6f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Top 1 Acc: {acc:.3f} Mode: {mode}".format(
+                        "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. Total Loss: {total_loss:.4f}. MSE Loss: {mse_loss:.4f}. View Loss: {sigmoid_loss:.4f}. Local Contrastive Loss: {local_contrastive_loss:.4f}. Global Contrastive Loss: {global_contrastive_loss:.4f}. LR: {lr:.6f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Top 1 Acc: {acc:.3f} Mode: {mode}".format(
                             epoch=epoch + 1,
                             epochs=args.epochs,
                             batch=batch_idx + 1,
@@ -409,6 +426,7 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
                             total_loss=losses[mode].avg,
                             mse_loss=losses["mse_loss"].avg,
                             local_contrastive_loss=losses["local_contrastive_loss"].avg,
+                            sigmoid_loss=losses["sigmoid_loss"].avg,
                             global_contrastive_loss=losses["global_contrastive_loss"].avg,
                             acc=top1[mode].avg,
                             mode=mode))

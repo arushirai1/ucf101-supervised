@@ -17,7 +17,7 @@ def info_nce_loss(features, batch_size, views, temperature=0.05, supervised=Fals
     if supervised:
         labels = labels
     else:
-        labels = torch.cat([torch.arange(batch_size) for i in range(views)], dim=0) #TODO: replace this with true labels for supervised contrastive learning
+        labels = torch.cat([torch.arange(batch_size) for i in range(views)], dim=0)
 
     labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
     features = F.normalize(features, dim=1)

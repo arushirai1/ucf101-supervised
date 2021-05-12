@@ -58,7 +58,7 @@ class ContrastiveDataset(Dataset):
         if self.args.combined_multiview_training or self.args.joint_only_multiview_training:
             positives = torch.cat(positives, dim=0)
         if self.args.classify_view:
-            return positives, video_label-1, [int(video_path[-1])-1 for video_path in video_paths]
+            return positives, [video_label-1, [int(video_path['path'][-1])-2 for video_path in video_paths]]
         return positives, video_label-1
 
     def _get_ids(self, no_frames, total_frames, skip_rate, ids):
