@@ -149,9 +149,10 @@ def main_training_testing():
     parser.add_argument('--curriculum-learning', action='store_true', default=False,
                         help='have a graduated learning scheme where initially single views are presented and then multiview joint data is presented after a number of epochs')
     parser.add_argument('--pretrained-path', default='', type=str, help='path to weights of contrastive pretrained model')
+    parser.add_argument('--pseudo-label', action='store_true', default=False,
+                        help='train using pseudo-labeling')
     parser.add_argument('--tcl', action='store_true', default=False,
                         help='train using tcl')
-
     args = parser.parse_args()
     print(args)
 
@@ -260,10 +261,10 @@ def main_training_testing():
 
     args.iteration = sum([len(dataset) for dataset in train_datasets]) // args.batch_size // args.world_size
     train_sampler = RandomSampler
-    train_datasets = [random_split(train_dataset, (round(args.percentage*len(train_dataset)), round((1-args.percentage)*len(train_dataset))))[0] for train_dataset in train_datasets]
+    #train_datasets = [random_split(train_dataset, (round(args.percentage*len(train_dataset)), round((1-args.percentage)*len(train_dataset))))[0] for train_dataset in train_datasets]
     train_loaders = [DataLoader(
         train_dataset,
-        sampler=train_sampler(train_dataset),
+        sampler=SequentialSampler(train_dataset),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         drop_last=True,
@@ -380,6 +381,14 @@ def accuracy(output, target, topk=(1,)):
 def calculate_reconstruction_loss(y_hat, x):
     return F.binary_cross_entropy(y_hat.view((y_hat.shape[0], -1)), x.view((x.shape[0], -1)), reduction='none').sum(dim=1).mean()
 
+def get_weight(epoch, T1, T2, a=1):
+    if epoch < T1:
+        return 0
+    elif epoch > T1 and epoch < T2:
+        return ((epoch-T1)/(T2-T1))*a
+    else:
+        return a
+
 def train(args, train_loaders, model, optimizer, scheduler, epoch, decoder=None):
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -395,33 +404,27 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch, decoder=None)
 
     for train_loader in train_loaders:
         for batch_idx, (inputs_x, targets_x) in enumerate(train_loader):
-
             data_time.update(time.time() - end)
             inputs = inputs_x.to(args.device)
             targets_x = targets_x.to(args.device)
-
             logits_x = model(inputs)
-            if decoder:
-                repr, generated_output = decoder(logits_x.cuda(1))
-                if args.sigmoid_loss:
-                    loss = calculate_reconstruction_loss(generated_output, inputs.cuda(1))
-                else:
-                    loss = torch.nn.MSELoss()(generated_output, inputs.cuda(1))
-                if args.local_contrastive_loss:
-                    logits_x_2 = torch.split(logits_x, logits_x.shape[0]/2)
-                    logits_x_2=torch.stack(logits_x_2[1], logits_x_2[0])
-
-                    logits_x = einops.reduce(logits_x, 'b c logits -> b logits', 'mean',
-                                             c=args.no_clips)
-                    # TODO continue fwd pass
-                    loss += 0.3*F.triplet_margin_loss(logits_x, logits_x_2, repr)+0.7*F.cross_entropy(logits_x, targets_x, reduction='mean')
-            else:
-                logits_x = einops.reduce(logits_x, 'b c logits -> b logits', 'mean',
-                                        c=args.no_clips)
-                loss = F.cross_entropy(logits_x, targets_x, reduction='mean')
-                prec1, prec5 = accuracy(logits_x.data, targets_x, topk=(1, 5))
-                top1.update(prec1, inputs.size(0))
-                top5.update(prec5, inputs.size(0))
+            #logits_x = einops.reduce(logits_x, 'b c logits -> b logits', 'mean', c=args.no_clips)
+            pseudo_label_mask = torch.where(targets_x == (args.num_class), 1, 0)
+            n2 = torch.sum(pseudo_label_mask)
+            true_label_mask = torch.where(targets_x != (args.num_class), 1, 0)
+            n1 = torch.sum(true_label_mask)
+            pseudo_labels = torch.argmax(logits_x, dim=1)
+            targets_x = torch.mul(true_label_mask, targets_x) + torch.mul(pseudo_label_mask, pseudo_labels)
+            loss = F.cross_entropy(logits_x, targets_x, reduction='none')
+            pseudo_loss_weight = (1/n2)*get_weight(epoch, T1=50, T2=200) if n2 != 0 else 0
+            true_loss_weight = 1/n1 if n1 != 0 else 0
+            pseudo_label_mask = pseudo_label_mask*pseudo_loss_weight
+            true_label_mask = true_label_mask*true_loss_weight
+            element_wise_weight = pseudo_label_mask + true_label_mask
+            loss = torch.sum(torch.mul(loss.T, element_wise_weight))
+            prec1, prec5 = accuracy(logits_x.data, targets_x, topk=(1, 5))
+            top1.update(prec1, inputs.size(0))
+            top5.update(prec5, inputs.size(0))
 
             losses.update(loss.item())
 
@@ -486,9 +489,7 @@ def test(args, test_loader, model, eval_mode=False, decoder=None):
                 if eval_mode:
                     outputs = einops.reduce(outputs, '(b c) logits -> b logits', 'mean',
                                             c=args.no_clips)
-                else:
-                    outputs = einops.reduce(outputs, 'b c logits -> b logits', 'mean',
-                                            c=args.no_clips)
+                #outputs = einops.reduce(outputs, 'b c logits -> b logits', 'mean', c=args.no_clips)
                 loss = F.cross_entropy(outputs, targets, reduction='mean')
 
                 for i, target in enumerate(targets):

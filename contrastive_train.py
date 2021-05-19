@@ -153,7 +153,10 @@ def main_training_testing(EXP_NAME):
                         help='Freeze the mse grad')
     parser.add_argument('--classify-view', action='store_true', default=False,
                         help='Classify the view')
-
+    parser.add_argument('--break-embedding', action='store_true', default=False,
+                        help='Will break embeddings instead of using an autoencoder')
+    parser.add_argument('--tcl', action='store_true', default=False,
+                        help='Will use tcl')
     args = parser.parse_args()
 
     if args.cross_subject and args.no_views < 3 and not args.hard_positive:
@@ -193,7 +196,6 @@ def main_training_testing(EXP_NAME):
     writer = SummaryWriter(out_dir)
 
     train_datasets, test_dataset = DATASET_GETTERS[args.dataset]('Data', args.frames_path, contrastive=True, num_clips=args.no_clips, multiview=args.multiview, augment=args.augment, cross_subject=args.cross_subject, hard_positive=args.hard_positive, random_temporal=args.random_temporal, args=args)
-
     if args.semi_supervised_contrastive_joint_training:
         train_dataset = train_datasets[-1]
         train_datasets[-1] = random_split(train_dataset, (round(args.percentage * len(train_dataset)), round((1 - args.percentage) * len(train_dataset))))[0]
@@ -223,7 +225,7 @@ def main_training_testing(EXP_NAME):
 
 
         model = ContrastiveModel(_backbone_callback, args.feature_size) if not args.decoder else ContrastiveDecoderModel(_backbone_callback, args.feature_size)
-        model = ContrastiveDecoderModelWithViewClassification(_backbone_callback, args.feature_size) if args.classify_view else model
+        model = ContrastiveDecoderModelWithViewClassification(_backbone_callback, args.feature_size, args.break_embedding) if args.classify_view else model
 
         args.iteration = len(train_datasets[0]) // args.batch_size // args.world_size
 
@@ -343,13 +345,17 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
                 else:
                     if args.decoder:
                         if args.classify_view:
-                            compressed_repr, generated_output, contrastive_repr, view_classification = model(inputs, detach=args.freeze_mse_grad)
+                            if args.break_embedding:
+                                contrastive_repr, view_classification = model(inputs, detach=args.freeze_mse_grad)
+                            else:
+                                compressed_repr, generated_output, contrastive_repr, view_classification = model(inputs, detach=args.freeze_mse_grad)
                             view_classification = view_classification.squeeze()
                         else:
                             compressed_repr, generated_output, contrastive_repr = model(inputs, detach=args.freeze_mse_grad)
                         logits = contrastive_repr = einops.reduce(contrastive_repr, 'b c logits -> b logits', 'mean', c=args.no_clips)
-                        compressed_repr = einops.reduce(compressed_repr, 'b c logits -> b logits', 'mean', c=args.no_clips)
-                        reconstruction_loss = torch.nn.MSELoss()(generated_output, inputs)
+                        if not args.break_embedding:
+                            compressed_repr = einops.reduce(compressed_repr, 'b c logits -> b logits', 'mean', c=args.no_clips)
+                            reconstruction_loss = torch.nn.MSELoss()(generated_output, inputs)
                     else:
                         logits = model(inputs)
 
@@ -365,13 +371,15 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
                 global_contrastive_loss = loss
                 if args.classify_view:
                     sigmoid_loss = torch.nn.BCEWithLogitsLoss()(view_classification, view_label.type(torch.FloatTensor).to(args.device))
-                    loss = reconstruction_loss + sigmoid_loss + global_contrastive_loss
+                    if args.break_embedding:
+                        loss = sigmoid_loss + global_contrastive_loss
+                    else:
+                        loss = reconstruction_loss + sigmoid_loss + global_contrastive_loss
                 else:
                     local_contrastive_loss = F.triplet_margin_loss(contrastive_repr, logits_x_2, compressed_repr, margin=args.margin)
                     loss = reconstruction_loss + args.alpha*local_contrastive_loss + args.beta*global_contrastive_loss
                 #loss = args.alpha*local_contrastive_loss + args.beta*global_contrastive_loss
-
-            batch_top1, batch_top5 = accuracy(logits, labels, topk=(1, 5))
+            batch_top1 = accuracy(logits, labels, topk=[1])[0]
 
             # Scales the loss, and calls backward()
             # to create scaled gradients
@@ -379,7 +387,8 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
             losses[mode].update(loss.item())
             if args.decoder:
                 losses["global_contrastive_loss"].update(global_contrastive_loss.item())
-                losses["mse_loss"].update(reconstruction_loss.item())
+                if not args.break_embedding:
+                    losses["mse_loss"].update(reconstruction_loss.item())
                 if args.classify_view:
                     losses["sigmoid_loss"].update(sigmoid_loss.item())
                 else:
@@ -387,7 +396,6 @@ def train(args, train_loaders, model, optimizer, scheduler, epoch):
 
 
             top1[mode].update(batch_top1[0])
-            top5.update(batch_top5[0])
             # Unscales gradients and calls
             scaler.step(optimizer)
 
@@ -458,8 +466,10 @@ def test(args, test_loader, model, eval_mode=False):
 
             inputs = inputs.to(args.device)
             targets = targets.to(args.device)
-
-            outputs = model(inputs)
+            if args.semi_supervised_contrastive_joint_training:
+                outputs = model(inputs, mode="semi_supervised")
+            else:
+                outputs = model(inputs)
             # TODO: change loss calculation for each output type
             if eval_mode:
                 outputs=einops.reduce(outputs, '(b c) logits -> b logits', 'mean', c = args.no_clips)

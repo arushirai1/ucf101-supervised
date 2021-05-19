@@ -28,6 +28,8 @@ class ContrastiveDataset(Dataset):
         self.root = root
         self.cross_subject = cross_subject
         self.args = args
+        if self.args.tcl:
+            self.skip_rates = [1,2]
         if not cross_subject:
             self.views=[2,3]
         else:
@@ -50,8 +52,11 @@ class ContrastiveDataset(Dataset):
         positives = []
         ids = []
 
-        for view_dict in video_paths:
-            video, ids_tmp = self.get_video(view_dict, ids)
+        for i, view_dict in enumerate(video_paths):
+            if self.args.tcl:
+                video, ids_tmp = self.get_video(view_dict, ids, skip_rate=self.skip_rates[i])
+            else:
+                video, ids_tmp = self.get_video(view_dict, ids)
             if not self.random_temporal:
                 ids = ids_tmp
             positives.append(video)
@@ -81,9 +86,8 @@ class ContrastiveDataset(Dataset):
             ids = [handle_edge_case(ratio) for ratio in ids]
         return list(ids)
 
-    def get_video(self, video_dict, ids=[]):
+    def get_video(self, video_dict, ids=[], skip_rate=2):
         no_frames = video_dict['no_frames']-1
-        skip_rate = 2
         total_frames = self.num_frames*skip_rate
 
         if total_frames*self.num_clips > no_frames:
@@ -163,11 +167,20 @@ class ContrastiveDataset(Dataset):
                 x = x.split()
                 video_name = x[0]
                 scene, pid, rid, action = self._decrypt_vid_name(video_name.split("/")[1])
-                positive_pair=[]
-                for view in self.views:
-                    positive_pair.append({'path':os.path.join(self.frames_path, video_name, str(view)), 'no_frames':int(x[view])})
-                targets.append(action)
-                data_paths.append(positive_pair)
+                if self.args.tcl:
+                    for view in self.views:
+                        positive_pair = []
+                        for _ in self.skip_rates:
+                            positive_pair.append(
+                                {'path': os.path.join(self.frames_path, video_name, str(view)), 'no_frames': int(x[view])})
+                        targets.append(action)
+                        data_paths.append(positive_pair)
+                else:
+                    positive_pair=[]
+                    for view in self.views:
+                        positive_pair.append({'path':os.path.join(self.frames_path, video_name, str(view)), 'no_frames':int(x[view])})
+                    targets.append(action)
+                    data_paths.append(positive_pair)
         return data_paths, targets
 
     def build_hard_positive_paths(self, multiview=False):

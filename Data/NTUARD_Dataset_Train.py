@@ -18,9 +18,10 @@ from torchvision import transforms
 
 
 class NTUARD_TRAIN(Dataset):
-    def __init__(self, root = '', train=True, fold=1, transform=None, frames_path='', num_clips=3, num_frames=8, cross_subject=False):
+    def __init__(self, root = '', train=True, fold=1, transform=None, frames_path='', num_clips=3, num_frames=8, cross_subject=False, args=None):
 
         self.num_clips = num_clips
+        self.args = args
         self.num_frames = num_frames
         self.frames_path = frames_path
         self.root = root
@@ -116,6 +117,13 @@ class NTUARD_TRAIN(Dataset):
                         targets.append(action)
                     else:
                         print("Insufficient # of frames: ", video_name, view, x[view], self.num_clips*self.num_frames)
+
+        if self.args and self.args.pseudo_label and self.train:
+            indices = list(range(len(data_paths)))
+            sampled_indices = random.sample(indices, int(len(indices)*(1-self.args.percentage)))
+            for i in sampled_indices:
+                targets[i] = self.args.num_class + 1
+
         return data_paths, targets
 
 #dataset=NTUARD_TRAIN(root='',frames_path='/datasets/NTU-ARD/frames-240x135')

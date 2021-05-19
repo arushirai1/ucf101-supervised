@@ -78,6 +78,7 @@ def get_ntuard(root='Data', frames_path='/datasets/NTU-ARD/frames-240x135', num_
         ToTensor(1),
     ])
     '''
+    keys = dir(args)
 
     train_datasets = []
     transform_contrastive = transform_train
@@ -86,9 +87,8 @@ def get_ntuard(root='Data', frames_path='/datasets/NTU-ARD/frames-240x135', num_
                                              hard_positive=hard_positive, random_temporal=random_temporal,
                                              multiview=multiview, args=args)
     train_dataset = NTUARD_TRAIN(root=root, train=True, fold=1, cross_subject=cross_subject, transform=transform_train,
-                                 num_clips=num_clips, frames_path=frames_path)
-    test_dataset = NTUARD_TRAIN(root=root, train=False, fold=1, cross_subject=cross_subject, transform=transform_val, num_clips=num_clips, frames_path=frames_path)
-    keys = dir(args)
+                                 num_clips=num_clips, frames_path=frames_path, args=args if 'pseudo-label' in keys else None)
+    test_dataset = NTUARD_TRAIN(root=root, train=False, fold=1, cross_subject=cross_subject, transform=transform_val, num_clips=num_clips, frames_path=frames_path, args= args if 'pseudo-label' in keys else None)
     if contrastive:
         train_datasets.append(contrastive_dataset)
     elif 'combined_multiview_training' in keys and args.combined_multiview_training:
